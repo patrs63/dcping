@@ -103,14 +103,20 @@ struct dcping_cb {
 	uint32_t delay_usec;
 
 	/* verbs stuff */
+	struct ibv_device *ib_dev;
+	struct ibv_context *ctx;
 	struct ibv_comp_channel *channel;
 	struct ibv_cq_ex *cq;
 	struct ibv_pd *pd;
 	struct ibv_srq *srq;		/* server only (for DCT) */
 	struct ibv_qp *qp;		/* DCI (client) or DCT (server) */
+	struct ibv_qp *qp_2;            /* DCI (client2)*/
         struct ibv_qp_ex *qpex;		/* client only */
         struct mlx5dv_qp_ex *mqpex;	/* client only */
 	struct ibv_ah *ah;		/* client only */
+	struct ibv_qp_ex *qpex_2;	/* client2 only */
+        struct mlx5dv_qp_ex *mqpex_2;	/* client2 only */
+	struct ibv_ah *ah_2;		/* client2 only */
 	enum ibv_mtu mtu;
 	uint8_t is_global;
 	uint8_t sgid_index;
@@ -119,6 +125,7 @@ struct dcping_cb {
 	/* CM stuff */
 	struct rdma_event_channel *cm_channel;
 	struct rdma_cm_id *cm_id;	/* connection on client side,*/
+	struct rdma_cm_id *cm_id_2;     /* connection on client2 side*/
 					/* listener on service side. */
 
 	uint64_t hw_clocks_kHz;
@@ -145,19 +152,22 @@ struct rdma_event_channel *create_first_event_channel(void)
         return channel;
 }
 
-static void dcping_init_conn_param(struct dcping_cb *cb,
+static void dcping_init_conn_param(struct dcping_cb *cb, int conn_num,
 				   struct rdma_cm_id *cm_id,
 				   struct rdma_conn_param *conn_param)
 {
 	uint32_t qp_num = 0;
 
 	if (cb->is_server) {
+		//if(mlx5dv_reserved_qpn_alloc(cb->ctx,&qp_num)) {/*incase of failure*/
 		// fake a unique qp_num based on peer's IP addr + UDP port as we're
 		// using the same DCT as an external QPN from all RDMA_CM connection
 		qp_num = (((struct sockaddr_in *)rdma_get_peer_addr(cm_id))->sin_addr.s_addr) << 16;
 		qp_num |=  be16toh(rdma_get_dst_port(cm_id));
+		//}
 	} else {
-		qp_num = cb->qp->qp_num;
+		/*conn_num doesn't matter for server - used to pick qp_num for client*/
+		qp_num = (conn_num) ? cb->qp->qp_num : cb->qp_2->qp_num;
 	}
 
 	memset(conn_param, 0, sizeof(*conn_param));
@@ -241,7 +251,7 @@ static int dcping_create_qp(struct dcping_cb *cb)
 		cb->qp = mlx5dv_create_qp(cb->cm_id->verbs, &attr_ex, &attr_dv);
 	}
 	else {
-		/* create DCI */
+		/* create two DCI */
 		attr_dv.comp_mask |= MLX5DV_QP_INIT_ATTR_MASK_DC;
 		attr_dv.dc_init_attr.dc_type = MLX5DV_DCTYPE_DCI;
 
@@ -255,21 +265,24 @@ static int dcping_create_qp(struct dcping_cb *cb)
 		attr_dv.create_flags |= MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE; /*driver doesnt support scatter2cqe data-path on DCI yet*/
 
 		cb->qp = mlx5dv_create_qp(cb->cm_id->verbs, &attr_ex, &attr_dv);
+		cb->qp_2 = mlx5dv_create_qp(cb->cm_id_2->verbs, &attr_ex, &attr_dv);
 	}
 
-	if (!cb->qp) {
+	if (!cb->qp || !cb->qp_2) {
 		perror("mlx5dv_create_qp(DC)");
 		ret = errno;
 		return ret;
 	}
 	if (!cb->is_server) {
 		cb->qpex = ibv_qp_to_qp_ex(cb->qp);
-		if (!cb->qpex) {
+		cb->qpex_2 = ibv_qp_to_qp_ex(cb->qp_2);
+		if ((!cb->qpex) || (!cb->qpex_2)) {
 			perror("ibv_qp_to_qp_ex(DC)");
 			ret = errno;
 		}
 		cb->mqpex = mlx5dv_qp_ex_from_ibv_qp_ex(cb->qpex);
-		if (!cb->mqpex) {
+		cb->mqpex_2 = mlx5dv_qp_ex_from_ibv_qp_ex(cb->qpex_2);
+		if ((!cb->mqpex) || (!cb->mqpex_2)) {
 			perror("mlx5dv_qp_ex_from_ibv_qp_ex(DC)");
 			ret = errno;
 		}
@@ -305,6 +318,12 @@ static int dcping_modify_qp(struct dcping_cb *cb)
 			ret = errno;
 			return ret;
 		}
+
+		if (!cb->is_server && ibv_modify_qp(cb->qp_2, &attr, attr_mask)) {
+			perror("failed to modify QP2 to IBV_QPS_INIT");
+			ret = errno;
+			return ret;
+		}
 	}
 
 	/* modify QP to RTR */
@@ -337,6 +356,12 @@ static int dcping_modify_qp(struct dcping_cb *cb)
 			ret = errno;
 			return ret;
 		}
+
+		if (!cb->is_server && ibv_modify_qp(cb->qp_2, &attr, attr_mask)) {
+			perror("failed to modify QP2 to IBV_QPS_RTR");
+			ret = errno;
+			return ret;
+		}
 	}
 
 	if (!cb->is_server) {
@@ -360,6 +385,12 @@ static int dcping_modify_qp(struct dcping_cb *cb)
 			ret = errno;
 			return ret;
 		}
+
+		if (ibv_modify_qp(cb->qp_2, &attr, attr_mask)) {
+			perror("failed to modify QP2 to IBV_QPS_RTS");
+			ret = errno;
+			return ret;
+		}
 	}
 
 	return ret;
@@ -369,6 +400,7 @@ static void dcping_free_qp(struct dcping_cb *cb)
 {
 	DEBUG_LOG("dcping_free_qp/srq/cq/pd called on cb %p\n", cb);
 	if (cb->qp) ibv_destroy_qp(cb->qp);
+	if (cb->qp_2) ibv_destroy_qp(cb->qp_2);
 	if (cb->srq) ibv_destroy_srq(cb->srq);
 	ibv_destroy_cq(ibv_cq_ex_to_cq(cb->cq));
 	ibv_destroy_comp_channel(cb->channel);
@@ -437,6 +469,8 @@ static int dcping_setup_qp(struct dcping_cb *cb)
 		goto err5;
 	}
 	DEBUG_LOG("created qp %p (qpn=%d)\n", cb->qp, (cb->qp ? cb->qp->qp_num : (uint32_t)-1));
+	if(!cb->is_server)
+		DEBUG_LOG("created qp %p (qpn=%d)\n", cb->qp_2, (cb->qp_2 ? cb->qp_2->qp_num : (uint32_t)-1));
 
 	ret = ibv_query_device_ex(cb->cm_id->verbs, NULL, &device_attr_ex);
 	if (ret) {
@@ -456,6 +490,7 @@ static int dcping_setup_qp(struct dcping_cb *cb)
 
 err5:
 	ibv_destroy_qp(cb->qp);
+	if (cb->qp_2) ibv_destroy_qp(cb->qp_2);
 err4:
 	if (cb->srq)
 		ibv_destroy_srq(cb->srq);
@@ -627,7 +662,7 @@ static int dcping_run_server(struct dcping_cb *cb)
 				DEBUG_LOG("accepting client connection request from <%s:%d> (cm_id %p)\n", str, be16toh(rdma_get_dst_port(cm_id)), cm_id);
 
 				struct rdma_conn_param conn_param;
-				dcping_init_conn_param(cb, cm_id, &conn_param);
+				dcping_init_conn_param(cb, 0, cm_id, &conn_param);
 				ret = rdma_accept(cm_id, &conn_param);
 				if (ret) {
 					perror("rdma_accept");
@@ -680,8 +715,26 @@ static int dcping_client_dc_send_wr(struct dcping_cb *cb, uint64_t wr_id)
                         (uintptr_t)cb->local_buf_addr,
                         (uint32_t)cb->size);
 
+	/* second DCI Writes below */
+
+	/* 1st small RDMA Write for DCI connect, this will create cqe->ts_start */
+	ibv_wr_start(cb->qpex_2);
+	cb->qpex_2->wr_id = wr_id;
+	cb->qpex_2->wr_flags = IBV_SEND_SIGNALED;
+	ibv_wr_rdma_write(cb->qpex_2, cb->remote_buf_info.rkey, cb->remote_buf_info.addr);
+	mlx5dv_wr_set_dc_addr(cb->mqpex_2, cb->ah_2, cb->remote_buf_info.dctn, DC_KEY);
+	ibv_wr_set_sge(cb->qpex_2, cb->local_buf_mr->lkey,
+			(uintptr_t)cb->local_buf_addr, 1);
+
+	/* 2nd SIZE x RDMA Write, this will create cqe->ts_end */
+        ibv_wr_rdma_write(cb->qpex_2, cb->remote_buf_info.rkey, cb->remote_buf_info.addr);
+        mlx5dv_wr_set_dc_addr(cb->mqpex_2, cb->ah_2, cb->remote_buf_info.dctn, DC_KEY);
+        ibv_wr_set_sge(cb->qpex_2, cb->local_buf_mr->lkey,
+                        (uintptr_t)cb->local_buf_addr,
+                        (uint32_t)cb->size);
+
 	/* ring DB */
-	return ibv_wr_complete(cb->qpex);
+	return ibv_wr_complete(cb->qpex) || ibv_wr_complete(cb->qpex_2);
 }
 
 static int dcping_client_wait_cq_event(struct dcping_cb *cb)
@@ -735,9 +788,9 @@ static int dcping_client_process_cqe(struct dcping_cb *cb, uint64_t wr_id, uint6
 	return 0;
 }
 
-static int dcping_client_get_cqe_tiemstmp(struct dcping_cb *cb, uint64_t wr_id, uint64_t *ts_hw_start, uint64_t *ts_hw_end)
+static int dcping_client_get_cqe_timestmp(struct dcping_cb *cb, uint64_t wr_id, uint64_t *ts_hw_start, uint64_t *ts_hw_end)
 {
-	/* we expect 2 cqe matching wr_id's to input */
+	/* we expect 4 cqe matching wr_id's to input */
 
 	int ret, step=0;
 	uint64_t ts_hw;
@@ -776,7 +829,7 @@ static int dcping_client_get_cqe_tiemstmp(struct dcping_cb *cb, uint64_t wr_id, 
 
 		step++;
 
-	} while (step < 2);
+	} while (step < 4);
 
 	return 0;
 }
@@ -795,7 +848,7 @@ static int dcping_test_client(struct dcping_cb *cb)
 	printf("connected to server, starting DC RTT test\n");
 
 	for (ping = 0; !cb->count || ping < cb->count; ping++) {
-		/* initiate RDMA Write x2 ops to create tiemstamp CQE's */
+		/* initiate RDMA Write x4 ops to create timestamp CQE's */
 		DEBUG_LOG_FAST_PATH("before post send \n");
 		ret = dcping_client_dc_send_wr(cb, ping);
 		if (ret) {
@@ -804,7 +857,7 @@ static int dcping_test_client(struct dcping_cb *cb)
 
 		/* wait for CQE's with timestamp */
 		DEBUG_LOG_FAST_PATH("before cqe check\n");
-		ret = dcping_client_get_cqe_tiemstmp(cb, ping, &ts_hw_start, &ts_hw_end);
+		ret = dcping_client_get_cqe_timestmp(cb, ping, &ts_hw_start, &ts_hw_end);
 		if (ret) {
 			DEBUG_LOG("cqe processing failed :(\n");
 			return ret;
@@ -833,62 +886,70 @@ static int dcping_test_client(struct dcping_cb *cb)
 
 static int dcping_connect_client(struct dcping_cb *cb)
 {
-	int ret;
+	int ret, ret2;
 	int qp_attr_mask;
 	struct ibv_qp_attr qp_attr;
-	struct rdma_cm_id *cm_id;
-	enum rdma_cm_event_type cm_event;
-	struct rdma_conn_param conn_param;
+	struct rdma_cm_id *cm_id, *cm_id_2;
+	enum rdma_cm_event_type cm_event, cm_event_2;
+	struct rdma_conn_param conn_param, conn_param_2;
 
 	DEBUG_LOG("rdma_connecting...\n");
-	dcping_init_conn_param(cb, cb->cm_id, &conn_param);
+	dcping_init_conn_param(cb, 1, cb->cm_id, &conn_param);
+	dcping_init_conn_param(cb, 0,cb->cm_id_2, &conn_param_2);
 	ret = rdma_connect(cb->cm_id, &conn_param);
-	if (ret) {
+	ret2 = rdma_connect(cb->cm_id_2, &conn_param_2);
+	if (ret || ret2) {
 		perror("rdma_connect");
 		return ret;
 	}
 
 	ret = dcping_handle_cm_event(cb, &cm_event, &cm_id);
-	if (ret || cm_event != RDMA_CM_EVENT_CONNECT_RESPONSE) {
-		perror("rdma_connect wrong responce");
+	ret2 = dcping_handle_cm_event(cb, &cm_event_2, &cm_id_2);
+	if (ret || cm_event != RDMA_CM_EVENT_CONNECT_RESPONSE ||
+	    ret2 || cm_event_2 != RDMA_CM_EVENT_CONNECT_RESPONSE) {
+		perror("rdma_connect wrong response");
 		ret = errno;
 		return ret;
 	}
 
 	qp_attr.qp_state = IBV_QPS_RTR;
 	ret = rdma_init_qp_attr(cb->cm_id, &qp_attr, &qp_attr_mask);
-	if (ret) {
+	ret2 = rdma_init_qp_attr(cb->cm_id_2, &qp_attr, &qp_attr_mask);
+	if (ret || ret2) {
 		perror("rdma_init_qp_attr");
 		ret = errno;
 		return ret;
 	}
 
 	cb->ah = ibv_create_ah(cb->pd, &qp_attr.ah_attr);
-	if (!cb->ah) {
+	cb->ah_2 = ibv_create_ah(cb->pd, &qp_attr.ah_attr);
+	if (!cb->ah || !cb->ah_2) {
 		perror("ibv_create_ah");
 		ret = errno;
 		return ret;
 	}
 	DEBUG_LOG("created ah (%p)\n", cb->ah);
+	DEBUG_LOG("created ah (%p)\n", cb->ah_2);
 
 	ret = rdma_establish(cb->cm_id);
-	if (ret) {
+	ret2 = rdma_establish(cb->cm_id_2);
+	if (ret || ret2) {
 		perror("rdma_establish");
 		ret = errno;
 		return ret;
 	}
 
-	DEBUG_LOG("rdma_connect successful\n");
+	DEBUG_LOG("rdma_connect successful for both DCI's\n");
 	return 0;
 }
 
 static int dcping_bind_client(struct dcping_cb *cb)
 {
-	int ret;
+	int ret, ret2;
 	char str[MAX_INET_ADDRSTRLEN];
 	struct ibv_port_attr port_attr;
-	struct rdma_cm_id *cm_id;
-	enum rdma_cm_event_type cm_event;       
+	struct rdma_cm_id *cm_id, *cm_id_2;
+	enum rdma_cm_event_type cm_event, cm_event_2;
 
 	if (cb->sin.ss_family == AF_INET) {
 		((struct sockaddr_in *) &cb->sin)->sin_port = cb->port;
@@ -898,30 +959,40 @@ static int dcping_bind_client(struct dcping_cb *cb)
 		((struct sockaddr_in6 *) &cb->sin)->sin6_port = cb->port;
 		inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)&cb->sin)->sin6_addr), str, sizeof(str));
 	}
-
-	if (cb->ssource.ss_family) 
+	if (cb->ssource.ss_family) {
 		ret = rdma_resolve_addr(cb->cm_id, (struct sockaddr *) &cb->ssource,
 				(struct sockaddr *) &cb->sin, 2000);
-	else
+		ret2 = rdma_resolve_addr(cb->cm_id_2, (struct sockaddr *) &cb->ssource,
+				(struct sockaddr *) &cb->sin, 2000);
+	}
+	else {
 		ret = rdma_resolve_addr(cb->cm_id, NULL, (struct sockaddr *) &cb->sin, 2000);
-
-	if (ret) {
+		ret2 = rdma_resolve_addr(cb->cm_id_2, NULL, (struct sockaddr *) &cb->sin, 2000);
+	}
+	if (ret || ret2) {
 		perror("rdma_resolve_addr");
 		return ret;
 	}
 
 	ret = dcping_handle_cm_event(cb, &cm_event, &cm_id);
-	if (cm_event != RDMA_CM_EVENT_ADDR_RESOLVED) {
+	ret2 = dcping_handle_cm_event(cb, &cm_event_2, &cm_id_2);
+	if (cm_event != RDMA_CM_EVENT_ADDR_RESOLVED ||
+	    cm_event_2 != RDMA_CM_EVENT_ADDR_RESOLVED)
+	{
 		return -1;
 	}
 
 	ret = rdma_resolve_route(cb->cm_id, 2000);
-	if (ret) {
+	ret2 = rdma_resolve_route(cb->cm_id_2, 2000);
+	if (ret || ret2) {
 		perror("rdma_resolve_route");
 	}
 
 	ret = dcping_handle_cm_event(cb, &cm_event, &cm_id);
-	if (cm_event != RDMA_CM_EVENT_ROUTE_RESOLVED) {
+	ret2 = dcping_handle_cm_event(cb, &cm_event_2, &cm_id_2);
+	if (cm_event != RDMA_CM_EVENT_ROUTE_RESOLVED ||
+	    cm_event_2 != RDMA_CM_EVENT_ROUTE_RESOLVED)
+	{
 		return -1;
 	}
 
@@ -974,6 +1045,7 @@ static int dcping_run_client(struct dcping_cb *cb)
 	ret = 0;
 err3:
 	rdma_disconnect(cb->cm_id);
+	rdma_disconnect(cb->cm_id_2);
 err2:
 	dcping_free_buffers(cb);
 err1:
@@ -1027,9 +1099,11 @@ static void usage(const char *name, int op)
 
 int main(int argc, char *argv[])
 {
+	struct ibv_device **dev_list;
 	struct dcping_cb *cb;
 	int op;
 	int ret = 0;
+	int ret2 = 0;
 
 	cb = malloc(sizeof(*cb));
 	if (!cb)
@@ -1100,18 +1174,33 @@ int main(int argc, char *argv[])
 		goto out;
 	}
 
+	dev_list = ibv_get_device_list(NULL);
+	if(!dev_list || !(dev_list[0])) {
+		perror("ibv_get_device_list");
+		goto out;
+	}
+	cb->ib_dev = dev_list[0];
+
+	cb->ctx = ibv_open_device(cb->ib_dev);
+	if (!cb->ctx) {
+		perror("ibv_open_device");
+		goto out1;
+	}
+
 	cb->cm_channel = create_first_event_channel();
 	if (!cb->cm_channel) {
 		ret = errno;
-		goto out;
+		goto out2;
 	}
 
 	ret = rdma_create_id(cb->cm_channel, &cb->cm_id, cb, RDMA_PS_TCP);
-	if (ret) {
+	ret2 = rdma_create_id(cb->cm_channel, &cb->cm_id_2, cb, RDMA_PS_TCP);
+	if (ret || ret2) {
 		perror("rdma_create_id");
-		goto out2;
+		goto out3;
 	}
 	DEBUG_LOG("created cm_id %p\n", cb->cm_id);
+	DEBUG_LOG("created cm_id %p\n", cb->cm_id_2);
 
 	if (cb->is_server) {
 		ret = dcping_run_server(cb);
@@ -1121,8 +1210,16 @@ int main(int argc, char *argv[])
 
 	DEBUG_LOG("destroy cm_id %p\n", cb->cm_id);
 	rdma_destroy_id(cb->cm_id);
-out2:
+	if (!cb->is_server) {
+		rdma_destroy_id(cb->cm_id_2);
+		DEBUG_LOG("destroy cm_id %p\n", cb->cm_id_2);
+	}
+out3:
 	rdma_destroy_event_channel(cb->cm_channel);
+out2:
+	ibv_close_device(cb->ctx);
+out1:
+	ibv_free_device_list(dev_list);
 out:
 	free_cb(cb);
 	return ret;
